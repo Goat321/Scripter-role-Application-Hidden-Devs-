@@ -1,0 +1,130 @@
+--|| Services ||--
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+--|| Folders ||--
+local Handlers = ReplicatedStorage:WaitForChild("Handlers")
+local Modules = ReplicatedStorage:WaitForChild("Modules")
+
+--|| Modules ||--
+local NET = require(Handlers.NET)
+local DespawnTypes = require(script.DespawnTypes)
+
+--|| Variables ||--
+local ProjectileHolder = workspace.Projectiles
+local ProjectileRemote = NET.Projectiles
+
+type ProjectileData = {
+	CFrame: CFrame,
+	Duration: number,
+	DespawnType: string?
+}
+
+type Projectile = ProjectileData & {
+	Id: string,
+	Projectile: Model | BasePart,
+}
+
+local Projectiles: {Projectile} = {}
+local PendingRemoval: {Projectile} = {}
+local Connection: RBXScriptConnection
+
+local function safeCall(func: (...any) -> ...any, ...): (boolean, any) --safe calling any function
+	return xpcall(func, function(errMsg: string)
+		warn(`Exception handled while safe calling function {debug.info(func, "n")}: {debug.traceback(errMsg)}`)
+	end, ...)
+end
+
+local function CombineTables(...) --combines 2 or more tables to 1
+	local CombineResult = {}
+	for _, Table in {...} do
+		for Key, Value in Table do
+			CombineResult[Key] = Value
+		end
+	end
+
+	return CombineResult
+end
+
+local function UpdateProjectiles(DeltaTime: number) --updates every projectile's position based on delta time
+	local Alpha = math.min(DeltaTime * 25, 1)
+	if #PendingRemoval ~= 0 then
+		for _, Projectile in PendingRemoval do  --checks if projectile is pending to removal
+			local Index = table.find(Projectiles, Projectile)
+			if not Index then continue end
+			
+			table.remove(Projectiles, Index)
+		end
+		
+		table.clear(PendingRemoval)
+	end
+	
+	for _, Projectile in Projectiles do
+		local Model = Projectile.Projectile
+		local CurrentCFrame = Model:GetPivot()
+		local TargetCFrame = Projectile.CFrame
+		if TargetCFrame == CurrentCFrame then continue end
+		
+		Model:PivotTo( CurrentCFrame:Lerp(TargetCFrame, Alpha) )
+	end
+end
+
+local function RemoveProjectile(Projectile: Projectile) -- just removes projectile :3
+	local Model = Projectile.Projectile
+	local DespawnType = DespawnTypes[Projectile.DespawnType]
+	if not DespawnType then
+		task.delay(1, Model.Destroy, Model)
+		return
+	end
+	
+	safeCall(DespawnType, Model)
+	Model:Destroy()
+end
+
+local RemoteFunctions: {[string]: (...any) -> ...any} = {}
+function RemoteFunctions.createProjectile(Id: string, Projectile: PVInstance, ServerTime: number, ProjectileData: ProjectileData) --creates projectile and configures it
+	if workspace:GetServerTimeNow() - ServerTime >= ProjectileData.Duration then return end
+	
+	local ProjectileClone = Projectile:Clone()
+	ProjectileClone:PivotTo(ProjectileData.CFrame)
+	ProjectileClone.Parent = ProjectileHolder
+	
+	local ProjectileObject = CombineTables(ProjectileData, {
+		Id = Id,
+		Projectile = ProjectileClone
+	})
+	
+	table.insert(Projectiles, ProjectileObject)
+	
+	ProjectileClone.Destroying:Once(function()
+		table.insert(PendingRemoval, ProjectileObject)
+	end)
+end
+
+function RemoteFunctions.removeProjectile(Id: string) --remove the projectile
+	for Index, Projectile in Projectiles do
+		if Projectile.Id ~= Id then continue end
+		RemoveProjectile(Projectile)
+		
+		break
+	end
+end
+
+function RemoteFunctions.updateProjectile(ProjectileUpdates: {[string]: CFrame}) --updates cframes of projectiles
+	for _, Projectile in Projectiles do
+		local NextCFrame = ProjectileUpdates[Projectile.Id]
+		if not NextCFrame then continue end
+		
+		Projectile.CFrame = NextCFrame
+	end
+end
+
+local function OnClientEvent(EventType: string, ...) --fires required function
+	local Function = RemoteFunctions[EventType]
+	if not Function then return end
+	
+	Function(...)
+end
+
+ProjectileRemote:Connect(OnClientEvent)
+RunService.RenderStepped:Connect(UpdateProjectiles)
