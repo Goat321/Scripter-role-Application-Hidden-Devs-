@@ -1,5 +1,3 @@
--- I hope there are enough comments now.
-
 --|| Services ||--
 local ReplicatedStorage = game:GetService("ReplicatedStorage") -- Get reference to ReplicatedStorage service
 
