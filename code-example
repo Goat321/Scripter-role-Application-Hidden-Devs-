@@ -1,264 +1,234 @@
 --|| Services ||--
-local ReplicatedStorage = game:GetService("ReplicatedStorage") -- Get reference to ReplicatedStorage service
+local ReplicatedStorage = game:GetService("ReplicatedStorage") -- Core Roblox data replication service
 
 --|| Folders ||--
-local remotes = ReplicatedStorage.Remotes -- Reference to Remotes folder in ReplicatedStorage
-local modules = ReplicatedStorage.Modules -- Reference to Modules folder in ReplicatedStorage
+local remotes = ReplicatedStorage.Remotes -- Network communication handlers
+local modules = ReplicatedStorage.Modules -- Reusable code components
 
 --|| Modules ||--
-local loopsModule = require(modules.Loops) -- Load Loops module for frame-based loop functionality
+local loopsModule = require(modules.Loops) -- Frame-based loop management system
 
---|| Variables ||--
-local gameFPS = 60 -- Base frames per second value for calculations
-local oneFrame = 1/gameFPS -- Calculate duration of one frame in seconds
+--|| Projectile Configuration ||--
+local gameFPS = 60 -- Base simulation frequency (frames per second)
+local oneFrame = 1/gameFPS -- Time duration of single frame (0.016667s)
 
--- Create overlap parameters for map collision detection
-local mapParams = OverlapParams.new() -- Instantiate new OverlapParams object
-mapParams.FilterType = Enum.RaycastFilterType.Include -- Set filter to include only specified items
-mapParams.FilterDescendantsInstances = {workspace.Map} -- Only check collisions with workspace.Map
+-- Environment collision detection parameters (walls, floors)
+local mapParams = OverlapParams.new()
+mapParams.FilterType = Enum.RaycastFilterType.Include -- Only include specified objects
+mapParams.FilterDescendantsInstances = {workspace.Map} -- World geometry container
 
--- Module initialization
-local module = {} -- Create table to hold module functions
-module.__index = module -- Set metatable for OOP functionality
+-- Character collision detection parameters
+local combinedParams = OverlapParams.new()
+combinedParams.FilterType = Enum.RaycastFilterType.Include
+combinedParams.FilterDescendantsInstances = {workspace.Living} -- Active game characters
 
--- Type definitions for type checking and documentation
-export type newData = { -- Define type for new projectile data
-	Velocity: Vector3 | (first: boolean?) -> Vector3,
-	RotationOffset: CFrame?,
-	lastTime: number?,
-	hitboxSize: Vector3,
-	multiHit: boolean?,
-	ignoreWalls: boolean?,
-	hitboxOffset: CFrame?,
-	DestroyOnHit: boolean?,
-	OneTarget: (boolean | Model)?,
-	FPS: number?
+--|| Module Setup ||--
+local module = {} -- Projectile system container
+module.__index = module -- Enable OOP metatable functionality
+
+--|| Type Definitions ||--
+export type newData = {
+	Velocity: Vector3 | (first: boolean?) -> Vector3, -- Initial movement vector or dynamic calculator
+	RotationOffset: CFrame?, -- Visual orientation adjustment
+	lastTime: number?, -- Maximum lifespan in seconds
+	hitboxSize: Vector3, -- Collision detection dimensions
+	multiHit: boolean?, -- Allow multiple target impacts
+	ignoreWalls: boolean?, -- Phase through environment
+	hitboxOffset: CFrame?, -- Collision box position offset
+	DestroyOnHit: boolean?, -- Auto-remove on collision
+	OneTarget: (boolean | Model)?, -- Specific target restriction
+	FPS: number? -- Custom update frequency
 }
 
-export type data = { -- Define type for active projectile data
-	Velocity: Vector3 | () -> Vector3,
-	velocityFunction: ((first: boolean?) -> Vector3)?,
-	despawnFunction: ((projectile: Model, hitSomething: boolean?, hitMap: boolean?) -> nil)?,
-	RotationOffset: CFrame?,
-	hitboxPart: BasePart?,
-	hitboxOffset: CFrame?,
-	hitFunction: (hitCharacter: Model) -> boolean?,
-	model: Model | BasePart,
-	lastTime: number,
-	removing: boolean?,
-	alreadyHit: {Model?},
-	multiHit: boolean?,
-	oneTarget: (boolean | Model)?,
-	timePassed: number,
-	ignoreWalls: boolean?,
-	destroyOnHit: boolean,
-	hitboxId: number,
-	owner: Model
+export type data = {
+	Velocity: Vector3 | () -> Vector3, -- Current movement vector
+	velocityFunction: ((first: boolean?) -> Vector3)?, -- Dynamic velocity calculator
+	despawnFunction: ((projectile: Model, hitSomething: boolean?, hitMap: boolean?) -> nil)?, -- Custom cleanup handler
+	RotationOffset: CFrame?, -- Model rotation adjustment
+	hitboxPart: BasePart?, -- Invisible collision detector
+	hitboxOffset: CFrame?, -- Hitbox positional offset
+	hitFunction: (hitCharacter: Model) -> boolean?, -- Impact effect handler
+	model: Model | BasePart, -- Visual representation
+	lastTime: number, -- Total allowed lifespan
+	removing: boolean?, -- Destruction flag
+	alreadyHit: {Model?}, -- Previously impacted targets
+	multiHit: boolean?, -- Multi-target permission
+	oneTarget: (boolean | Model)?, -- Target restriction
+	timePassed: number, -- Active lifetime counter
+	ignoreWalls: boolean?, -- Environment collision bypass
+	destroyOnHit: boolean, -- Auto-destruct on impact
+	hitboxId: number, -- Unique collision identifier
+	owner: Model -- Projectile source character
 }
 
-local Projectiles = {} -- Table to track all active projectiles
+local Projectiles = {} -- Active projectile registry table
 
--- Create combined overlap parameters for character detection
-local combinedParams = OverlapParams.new() -- Instantiate new OverlapParams object
-combinedParams.FilterType = Enum.RaycastFilterType.Include -- Set filter to include only specified items
-combinedParams.FilterDescendantsInstances = {workspace.Living} -- Only check collisions with living characters
+--|| Helper Functions ||--
+local function isModelIgnored(model, ignoreList)
+	-- Check if model should be excluded from collision checks
+	if table.find(ignoreList, model) then return true end -- Direct match
+	for _, ignored in ignoreList do -- Ancestry check
+		if model:IsDescendantOf(ignored) then return true end
+	end
+	return false
+end
 
--- Function to validate hits against characters and destructibles
-local function checkHitbox(PartsHit: {BasePart}, IgnoreList: {Instance}, CombatInfo: {})
-	local CharactersHit = {} -- Table to store valid character targets
-	local Checked = {} -- Table to track processed models to avoid duplicates
+local function handleExpiredProjectile(projectileData)
+	-- Cleanup expired projectile components
+	projectileData.hitboxPart:Destroy() -- Remove collision detector
 
-	-- Determine if destructibles should be ignored based on CombatInfo
-	local IgnoreDestructibles = not (CombatInfo and CombatInfo.Damage) -- Check if damage is specified
-	local CombatInfo = CombatInfo -- Redundant declaration for type checking assistance
+	-- Standard destruction without callback
+	if not projectileData.despawnFunction then
+		projectileData.model:Destroy()
+		return false -- Signal for removal
+	end
 
-	-- Loop through all collided parts
-	for _, Part in PartsHit do -- Iterate through each part in PartsHit table
-		local Model = Part:FindFirstAncestorOfClass("Model") -- Find parent model of collided part
-		-- Skip if model is invalid or already processed
-		if not Model or table.find(Checked, Model) then continue end -- Continue to next iteration
+	-- Async callback execution
+	projectileData.removing = true -- Mark for destruction
+	task.spawn(function()
+		projectileData.despawnFunction(projectileData.model, false) -- No hit occurred
+		projectileData.model:Destroy()
+	end)
+	return false
+end
 
-		-- Check if model is in ignore list
-		local IsIgnored = table.find(IgnoreList, Model) -- Check direct ignore list
-		if not IsIgnored then -- If not directly ignored, check ancestry
-			-- Check if model is descendant of any ignored instances
-			for _, Ignored in IgnoreList do -- Iterate through ignore list
-				if not Model:IsDescendantOf(Ignored) then continue end -- Check parentage
-				IsIgnored = true -- Mark as ignored if descendant
-				break -- Exit ignore check loop
-			end -- End of ignore check loop
-		end -- End of ignore check block
+local function processCharacterHit(projectileData, character)
+	-- Validate target against impact criteria
+	if typeof(projectileData.oneTarget) == "Instance" and character ~= projectileData.oneTarget then return false end -- Wrong specific target
 
-		-- Handle ignored models
-		if IsIgnored then -- If model should be ignored
-			table.insert(Checked, Model) -- Add to processed list
-			continue -- Skip to next iteration
-		end -- End of ignore handling block
+	-- Single-target restriction check
+	if typeof(projectileData.oneTarget) == "boolean" and projectileData.alreadyHit[1] then return false end -- Already hit single target
 
-		-- Check for humanoid-containing models
-		local Humanoid = Model:FindFirstChild("Humanoid") -- Find humanoid in model
-		if Humanoid then -- If humanoid exists
-			table.insert(Checked, Model) -- Mark model as processed
-			-- Check if humanoid is alive and in Living folder
-			if Humanoid.Health > 0 and Model:FindFirstAncestor("Living") then -- Validate target
-				table.insert(CharactersHit, Model) -- Add to valid targets
-			end -- End of alive check
-			continue -- Skip destructible checks
-		elseif IgnoreDestructibles then -- If ignoring destructibles
-			continue -- Skip to next iteration
-		end -- End of humanoid/destructible check block
-	end -- End of parts loop
+	-- Duplicate hit prevention
+	if table.find(projectileData.alreadyHit, character) then return false end -- Already registered target
 
-	return CharactersHit -- Return validated character targets
-end -- End of checkHitbox function
+	-- Register hit and execute impact effects
+	table.insert(projectileData.alreadyHit, character)
+	return projectileData.hitFunction(character, true) -- Return success status
+end
 
--- Main projectile update function
-local function updateProjectile(deltaTime: number, projectileData: data)
-	-- Local variable caching for performance
-	local timePassed = projectileData.timePassed -- Get current lifetime
-	local model = projectileData.model -- Reference to projectile visual
-	local projectileOwner = projectileData.owner -- Reference to projectile owner
-	local velocityFunction = projectileData.velocityFunction -- Velocity calculation function
-	local despawnFunction = projectileData.despawnFunction -- Custom despawn handler
-	local hitFunction = projectileData.hitFunction -- Hit validation function
-	local ignoreWalls = projectileData.ignoreWalls -- Wall collision flag
-	local oneTarget = projectileData.oneTarget -- Single target restriction
-	local destroyOnHit = projectileData.destroyOnHit ~= false -- Destruction flag (default true)
-	local hitboxId = projectileData.hitboxId -- Unique hitbox identifier
-	local hitboxPart = projectileData.hitboxPart -- Collision detection part
+local function updatePosition(projectileData, deltaTime)
+	-- Calculate new position using velocity
+	local velocity = projectileData.Velocity
+	local model = projectileData.model
+	local currentCFrame = model:IsA("Model") and model:GetPivot() or model.CFrame
+	local nextCFrame = currentCFrame + (velocity * deltaTime) -- Position integration
 
-	-- Check for expiration conditions
-	if (timePassed >= projectileData.lastTime or model:GetAttribute("Stop")) and not projectileData.removing then
-		hitboxPart:Destroy() -- Remove collision part
+	-- Update visual representation if not frozen
+	if not model:GetAttribute("forceProjectileStop") then
+		if model:IsA("Model") then
+			model:PivotTo(nextCFrame) -- Position Model
+		else
+			model.CFrame = nextCFrame -- Position Single part
+		end
+	end
+end
 
-		-- Handle custom despawn logic
-		if despawnFunction then -- If custom despawn exists
-			projectileData.removing = true -- Mark as removing
-			task.spawn(function() -- Run in separate thread
-				despawnFunction(model, false) -- Call despawn callback
-				model:Destroy() -- Destroy visual
-			end) -- End of task.spawn
-			return false -- Signal to stop updates
-		else -- Default destruction
-			model:Destroy() -- Destroy visual immediately
-			return false -- Signal to stop updates
-		end -- End of despawn check
-	end -- End of expiration check
+--|| Main Functions ||--
+local function checkHitbox(PartsHit, IgnoreList, CombatInfo)
+	-- Process collision results into valid targets
+	local CharactersHit = {} -- Valid character impacts
+	local Checked = {} -- Processed models
+	local IgnoreDestructibles = not (CombatInfo and CombatInfo.Damage) -- Environmental damage flag
 
-	-- Calculate dynamic velocity
-	local velocityFunctionResult -- Stores velocity calculation
-	if velocityFunction then -- If using velocity function
-		local resultFunction = velocityFunction(false, oneFrame) -- Get velocity
-		if not projectileData.removing then -- Check if still active
-			velocityFunctionResult = resultFunction -- Store result
-		end -- End of removal check
-	end -- End of velocity function check
+	for _, Part in PartsHit do
+		local Model = Part:FindFirstAncestorOfClass("Model")
+		if not Model or table.find(Checked, Model) then continue end
 
-	-- Update hitbox position
-	local projectileCFrame -- Stores current position
-	if model:IsA("Model") then -- Handle model instances
-		projectileCFrame = model:GetPivot() -- Get model pivot
-	elseif model:IsA("BasePart") then -- Handle single parts
-		projectileCFrame = model.CFrame -- Get part CFrame
-	end -- End of model type check
-	hitboxPart.CFrame = projectileCFrame -- Sync hitbox position
+		-- Skip ignored models
+		if isModelIgnored(Model, IgnoreList) then 
+			table.insert(Checked, Model) 
+			continue 
+		end
 
-	-- Process collisions if active
-	if not projectileData.removing then -- Check if not being removed
-		-- Update velocity from function
-		if velocityFunction then -- Velocity function exists
-			projectileData.Velocity = velocityFunctionResult -- Update velocity
-		end -- End of velocity function update
+		-- Character impact detection
+		local Humanoid = Model:FindFirstChild("Humanoid")
+		if Humanoid then
+			table.insert(Checked, Model)
+			if Humanoid.Health > 0 and Model:FindFirstAncestor("Living") then
+				table.insert(CharactersHit, Model) -- Living valid target
+			end
+			continue
+		end
 
-		-- Detect character collisions
-		local charactersHit = checkHitbox(
-			workspace:GetPartBoundsInBox(projectileCFrame * projectileData.hitboxOffset, hitboxPart.Size, combinedParams),
-			{projectileOwner}
-		) -- Get valid targets
-		local hit = false -- Hit flag
-		local hitWall = false -- Wall collision flag
+		-- Skip destructible objects when not dealing damage
+		if IgnoreDestructibles then continue end
+	end
 
-		-- Process hit characters
-		for _, v in charactersHit do -- Iterate through hits
-			-- Handle multi-hit restrictions
-			if not projectileData.multiHit then -- Single-hit mode
-				-- Check single target restrictions
-				if typeof(oneTarget) == "Instance" and v ~= oneTarget then -- Wrong target
-					continue -- Skip processing
-				end -- End of wrong target check
+	return CharactersHit
+end
 
-				-- Check already hit targets
-				if typeof(oneTarget) == "boolean" and projectileData.alreadyHit[1] or table.find(projectileData.alreadyHit, v) then
-					continue -- Skip already hit
-				end -- End of already hit check
+local function updateProjectile(deltaTime, projectileData)
+	-- Main projectile simulation loop
 
-				table.insert(projectileData.alreadyHit, v) -- Register hit
-			end -- End of multi-hit check
+	-- Lifespan expiration check
+	if (projectileData.timePassed >= projectileData.lastTime or projectileData.model:GetAttribute("Stop")) and not projectileData.removing then return handleExpiredProjectile(projectileData) end
 
-			-- Execute hit callback
-			local result = hitFunction(v, not hit) -- Call hit handler
-			if result then -- If hit was successful
-				hit = true -- Mark as hit
-			end -- End of result check
-		end -- End of character loop
+	-- Update velocity from dynamic function
+	if projectileData.velocityFunction then
+		projectileData.Velocity = projectileData.velocityFunction(false, oneFrame)
+	end
 
-		-- Check for wall collisions if no characters hit
-		if not hit then -- Only check walls if no characters hit
-			local partsHit = workspace:GetPartsInPart(hitboxPart, mapParams) -- Get map parts
-			local hitPart = partsHit[1] -- Get first collision
-			hitWall = hitPart ~= nil and hitPart.CanCollide -- Validate wall collision
-		end -- End of wall check
+	-- Synchronize hitbox with visual model
+	local model = projectileData.model
+	local projectileCFrame = model:IsA("Model") and model:GetPivot() or model.CFrame
+	projectileData.hitboxPart.CFrame = projectileCFrame
 
-		-- Handle collision consequences
-		if hit or (hitWall and not ignoreWalls) then -- Valid collision
-			projectileData.Velocity = Vector3.zero -- Stop movement
-			hitboxPart:Destroy() -- Remove collision part
-			projectileData.removing = true -- Mark for removal
+	-- Skip processing if marked for removal
+	if projectileData.removing then return true end
 
-			-- Handle custom despawn
-			if despawnFunction then -- Custom despawn exists
-				task.spawn(function() -- Run in separate thread
-					despawnFunction(model, hit, hitWall) -- Call despawn callback
-					if destroyOnHit then -- Check destruction flag
-						model:Destroy() -- Destroy visual
-					end -- End of destruction check
-				end) -- End of task.spawn
-				return false -- Signal to stop updates
-			else -- Default handling
-				if destroyOnHit then -- Check destruction flag
-					model:Destroy() -- Destroy visual
-				end -- End of destruction check
-				return false -- Signal to stop updates
-			end -- End of despawn check
-		end -- End of collision check
-	end -- End of active projectile check
+	-- Detect character collisions
+	local charactersHit = checkHitbox(workspace:GetPartBoundsInBox(projectileCFrame * projectileData.hitboxOffset, projectileData.hitboxPart.Size, combinedParams), {projectileData.owner})
 
-	-- Calculate next position
-	local velocity = projectileData.Velocity -- Current velocity
-	local nextCFrame = projectileCFrame + (velocity * deltaTime) -- Calculate new position
+	-- Process character impacts
+	local hit = false
+	for _, v in charactersHit do
+		if processCharacterHit(projectileData, v) then
+			hit = true -- Successful hit registration
+		end
+	end
 
-	-- Apply movement if not forced to stop
-	if not model:GetAttribute("forceProjectileStop") then -- Check stop attribute
-		if model:IsA("Model") then -- check model's class is "Model"
-			model:PivotTo(nextCFrame) -- Move model
-		elseif model:IsA("BasePart") then -- check model's class is BasePart
-			model.CFrame = nextCFrame -- Move part
-		end -- End of model type check
-	end -- End of movement check
+	-- Environment collision detection
+	local hitWall = false
+	if not hit then
+		local partsHit = workspace:GetPartsInPart(projectileData.hitboxPart, mapParams)
+		hitWall = partsHit[1] and partsHit[1].CanCollide -- Solid surface check
+	end
 
-	projectileData.timePassed += deltaTime -- Update lifetime timer
-	return true -- Continue updates
-end -- End of updateProjectile function
+	-- Collision response handling
+	if hit or (hitWall and not projectileData.ignoreWalls) then
+		projectileData.Velocity = Vector3.zero -- Stop movement
+		projectileData.hitboxPart:Destroy() -- Remove collision
+		projectileData.removing = true -- Mark for cleanup
 
--- Projectile constructor
-function module.new(owner: Model, projectileModelorPart: Model | BasePart, from: Vector3, data: newData, hitFunction: (hitCharacter: Model) -> boolean?, despawnFunction: ((projectile: Model, hitSomething: boolean?, hitMap: boolean?) -> nil)?)
-	local projectileId = math.random() -- Generate unique ID
-	local model = projectileModelorPart -- Reference to projectile model
+		-- Custom despawn handling
+		if projectileData.despawnFunction then
+			task.spawn(function()
+				projectileData.despawnFunction(model, hit, hitWall)
+				if projectileData.destroyOnHit then model:Destroy() end
+			end)
+			return false
+		end
 
-	-- Initialize projectile data structure
-	local projectileData = { -- Create projectile state table
-		Velocity = if type(data.Velocity) == "vector" then data.Velocity elseif type(data.Velocity) == "function" then Vector3.zAxis else Vector3.zAxis,
-		velocityFunction = if type(data.Velocity) == "function" then data.Velocity else nil,
+		-- Immediate destruction
+		if projectileData.destroyOnHit then model:Destroy() end
+		return false
+	end
+
+	-- Position update and lifetime tracking
+	updatePosition(projectileData, deltaTime)
+	projectileData.timePassed += deltaTime
+	return true
+end
+
+--|| Public API ||--
+function module.new(owner, projectileModelorPart, from, data, hitFunction, despawnFunction)
+	-- Create new projectile instance
+	local projectileId = math.random() -- Unique identifier
+	local model = projectileModelorPart -- Visual representation
+	local projectileData = {
+		Velocity = if type(data.Velocity) == "vector" then data.Velocity else Vector3.zAxis,
+		velocityFunction = type(data.Velocity) == "function" and data.Velocity or nil,
 		hitboxPart = nil,
 		hitboxOffset = data.hitboxOffset or CFrame.new(),
 		despawnFunction = despawnFunction,
@@ -270,7 +240,7 @@ function module.new(owner: Model, projectileModelorPart: Model | BasePart, from:
 		multiHit = data.multiHit,
 		oneTarget = data.OneTarget,
 		alreadyHit = {},
-		lastTime = data.lastTime or 2, -- Default 2 second lifespan
+		lastTime = data.lastTime or 2, -- Default 2-second lifespan
 		timePassed = 0,
 		ignoreWalls = data.ignoreWalls or false,
 		destroyOnHit = data.DestroyOnHit,
@@ -278,60 +248,59 @@ function module.new(owner: Model, projectileModelorPart: Model | BasePart, from:
 	}
 
 	-- Initialize velocity from function
-	if projectileData.velocityFunction then -- If using velocity function
-		projectileData.Velocity = projectileData.velocityFunction(true, oneFrame) -- calculate velocity via function
-	end -- End of velocity function check
+	if projectileData.velocityFunction then
+		projectileData.Velocity = projectileData.velocityFunction(true, oneFrame)
+	end
 
-	-- Setup owner destruction cleanup
-	local desctructionConnect -- Connection reference
-	desctructionConnect = owner.AncestryChanged:Connect(function(child, parent) -- Listen for owner removal
-		if not parent then -- If owner is destroyed
-			model:Destroy() -- Destroy projectile
-			desctructionConnect:Disconnect() -- Cleanup connection
-			desctructionConnect = nil -- Clear reference
-		end -- End of parent check
-	end) -- End of connection
+	-- Owner destruction cleanup
+	local desctructionConnect; desctructionConnect = owner.AncestryChanged:Connect(function(_, parent)
+		if parent then return end -- Only trigger on actual deletion
+		model:Destroy()
+		desctructionConnect:Disconnect()
+	end)
 
-	-- Calculate CFrame
+	-- Position projectile model
 	local lookAt = CFrame.lookAt(from, from + projectileData.Velocity) * projectileData.RotationOffset
-	if model:IsA("Model") then -- check model's class is "Model"
-		model:PivotTo(lookAt) -- Position model
-	elseif model:IsA("BasePart") then -- check model's class is BasePart
-		model.CFrame = lookAt -- Position part
-	end -- End of model type check
-	model.Parent = workspace.Projectiles -- Place in projectiles folder
+	if model:IsA("Model") then
+		model:PivotTo(lookAt) -- Position model assembly
+	else
+		model.CFrame = lookAt -- Position single part
+	end
+	model.Parent = workspace.Projectiles -- Add to game world
 
-	-- Create collision hitbox
-	local hitboxPart = Instance.new("Part") -- Create new part
-	hitboxPart.Size = data.hitboxSize or Vector3.one -- Set hitbox size
-	hitboxPart.CFrame = lookAt -- Position hitbox
-	projectileData.hitboxPart = hitboxPart -- Store reference
+	-- Create collision detection part
+	local hitboxPart = Instance.new("Part")
+	hitboxPart.Size = data.hitboxSize or Vector3.one
+	hitboxPart.CFrame = lookAt
+	hitboxPart.Transparency = 1 -- Invisible collision
+	hitboxPart.CanCollide = false -- Prevent physics interactions
+	hitboxPart.Anchored = true -- Manual positioning
+	projectileData.hitboxPart = hitboxPart
 	Projectiles[model] = projectileData -- Register projectile
 
 	-- Start update loop
-	local loop = loopsModule.new(function(loopSelf, deltaTime: number) -- Create new loop
-		if not updateProjectile(deltaTime, projectileData) then -- Update projectile
-			loopSelf:Break() -- Stop loop if update fails
-		end -- End of update check
-	end, data.FPS or 60) -- Set update frequency
+	local loop = loopsModule.new(function(loopSelf, deltaTime)
+		if not updateProjectile(deltaTime, projectileData) then
+			loopSelf:Break() -- Stop loop on false return
+		end
+	end, data.FPS or 60) -- Use custom FPS or default 60
 
-	-- Create control interface
-	local self = {} -- Public methods table
-	function self:Destroy() -- Manual destruction method
-		hitboxPart:Destroy() -- Remove hitbox
+	-- Control interface
+	local self = {}
+	function self:Destroy()
+		hitboxPart:Destroy()
 		loop:Break() -- Stop update loop
-		model:Destroy() -- Remove visual
-		desctructionConnect:Disconnect() -- Cleanup connection
-		Projectiles[model] = nil -- Unregister projectile
-		desctructionConnect = nil -- Clear reference
-	end -- End of Destroy method
+		model:Destroy()
+		desctructionConnect:Disconnect()
+		Projectiles[model] = nil -- Deregister
+	end
 
-	return self -- Return control interface
-end -- End of new method
+	return self
+end
 
--- Projectile retrieval function
-function module.GetProjectileFromModel(Model: BasePart | Model): data? -- May return nil
-	return Projectiles[Model] -- Lookup in registry
-end -- End of GetProjectileFromModel
+function module.GetProjectileFromModel(Model)
+	-- Retrieve projectile data by visual model reference
+	return Projectiles[Model]
+end
 
-return module -- Return completed module
+return module
